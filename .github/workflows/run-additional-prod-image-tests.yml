@@ -1,0 +1,25 @@
+---
+name: Run Additional PROD Image Tests (manual)
+
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  additional-prod-image-tests:
+    uses: ./.github/workflows/additional-prod-image-tests.yml
+    with:
+      runners: '["ubuntu-24.04"]'
+      platform: "linux/amd64"
+      default-branch: "main"
+      run-task-sdk-integration-tests: "false"
+      constraints-branch: "main"
+      upgrade-to-newer-dependencies: "false"
+      docker-cache: "disabled"
+      disable-airflow-repo-cache: "false"
+      canary-run: "true"
+      default-python-version: "3.10"
+      use-uv: "true"
+      run-ui-e2e-tests: "true"
