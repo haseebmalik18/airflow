@@ -65,6 +65,7 @@ from airflow.models.taskinstance import (
     TaskInstance,
     TaskInstance as TI,
     TaskInstanceNote,
+    bulk_clear_dag_runs,
     clear_task_instances,
     find_relevant_relatives,
 )
@@ -4002,3 +4003,132 @@ def test_task_instance_repr_does_not_raise_for_deferred_columns(dag_maker, sessi
 
     assert "<deferred>" in result
     assert "[queued]" not in result
+
+
+class TestBulkClearDagRuns:
+    """Tests for ``bulk_clear_dag_runs``"""
+
+    DAG_ID = "test_bulk_clear_dag_runs"
+
+    @staticmethod
+    def _seed_runs(dag_maker, *, run_count: int = 3) -> list[str]:
+        with dag_maker(TestBulkClearDagRuns.DAG_ID, serialized=True):
+            EmptyOperator(task_id="t1")
+        run_ids: list[str] = []
+        for i in range(run_count):
+            run_id = f"bulk_run_{i:03d}"
+            dag_maker.create_dagrun(
+                run_id=run_id,
+                state=DagRunState.SUCCESS,
+                logical_date=datetime.datetime(2026, 3, 1, tzinfo=pendulum.UTC) + datetime.timedelta(days=i),
+            )
+            run_ids.append(run_id)
+        return run_ids
+
+    @staticmethod
+    def _set_ti_states(session, *, run_ids, state):
+        session.execute(
+            TaskInstance.__table__.update()
+            .where(TaskInstance.dag_id == TestBulkClearDagRuns.DAG_ID)
+            .where(TaskInstance.run_id.in_(run_ids))
+            .values(state=state)
+        )
+        session.commit()
+        # Drop stale ORM copies seeded by dag_maker so the bulk-clear path reads
+        # the post-UPDATE state.
+        session.expire_all()
+
+    @pytest.mark.db_test
+    def test_empty_run_ids_is_a_no_op(self, dag_maker, session):
+        self._seed_runs(dag_maker)
+        before_states = {
+            row.run_id: row.state
+            for row in session.scalars(select(DagRun).where(DagRun.dag_id == self.DAG_ID)).all()
+        }
+        cleared = bulk_clear_dag_runs(dag_id=self.DAG_ID, run_ids=[], session=session)
+        after_states = {
+            row.run_id: row.state
+            for row in session.scalars(select(DagRun).where(DagRun.dag_id == self.DAG_ID)).all()
+        }
+        assert cleared == 0
+        assert before_states == after_states
+
+    @pytest.mark.db_test
+    def test_clears_tis_across_many_runs(self, dag_maker, session):
+        run_ids = self._seed_runs(dag_maker, run_count=3)
+        self._set_ti_states(session, run_ids=run_ids, state=TaskInstanceState.SUCCESS)
+
+        cleared = bulk_clear_dag_runs(dag_id=self.DAG_ID, run_ids=run_ids, session=session)
+
+        assert cleared == 3
+        states = {
+            row.run_id: row.state
+            for row in session.scalars(select(DagRun).where(DagRun.dag_id == self.DAG_ID)).all()
+        }
+        assert all(states[run_id] == DagRunState.QUEUED for run_id in run_ids)
+        ti_states = list(
+            session.scalars(
+                select(TaskInstance.state).where(
+                    TaskInstance.dag_id == self.DAG_ID, TaskInstance.run_id.in_(run_ids)
+                )
+            )
+        )
+        assert ti_states == [None, None, None]
+
+    @pytest.mark.db_test
+    def test_only_failed_skips_runs_without_failed_tis(self, dag_maker, session):
+        run_ids = self._seed_runs(dag_maker, run_count=2)
+        failed_run, success_run = run_ids
+        self._set_ti_states(session, run_ids=[failed_run], state=TaskInstanceState.FAILED)
+        self._set_ti_states(session, run_ids=[success_run], state=TaskInstanceState.SUCCESS)
+
+        cleared = bulk_clear_dag_runs(dag_id=self.DAG_ID, run_ids=run_ids, only_failed=True, session=session)
+
+        assert cleared == 1
+        states = {
+            row.run_id: row.state
+            for row in session.scalars(select(DagRun).where(DagRun.dag_id == self.DAG_ID)).all()
+        }
+        assert states[failed_run] == DagRunState.QUEUED
+        assert states[success_run] == DagRunState.SUCCESS
+
+    @pytest.mark.db_test
+    def test_only_running_filters_to_running_tis(self, dag_maker, session):
+        run_ids = self._seed_runs(dag_maker, run_count=2)
+        running_run, failed_run = run_ids
+        self._set_ti_states(session, run_ids=[running_run], state=TaskInstanceState.RUNNING)
+        self._set_ti_states(session, run_ids=[failed_run], state=TaskInstanceState.FAILED)
+
+        cleared = bulk_clear_dag_runs(dag_id=self.DAG_ID, run_ids=run_ids, only_running=True, session=session)
+
+        assert cleared == 1
+        ti_states = {
+            row.run_id: row.state
+            for row in session.execute(
+                select(TaskInstance.run_id, TaskInstance.state).where(
+                    TaskInstance.dag_id == self.DAG_ID, TaskInstance.run_id.in_(run_ids)
+                )
+            ).all()
+        }
+        assert ti_states[running_run] == TaskInstanceState.RESTARTING
+        assert ti_states[failed_run] == TaskInstanceState.FAILED
+
+    @pytest.mark.db_test
+    def test_unknown_run_ids_are_a_no_op(self, dag_maker, session):
+        self._seed_runs(dag_maker, run_count=1)
+        cleared = bulk_clear_dag_runs(dag_id=self.DAG_ID, run_ids=["does-not-exist"], session=session)
+        assert cleared == 0
+
+    @pytest.mark.db_test
+    def test_folds_per_run_fetches_into_one_query(self, dag_maker, session):
+        """N runs trigger exactly one ``clear_task_instances`` call, not N"""
+        run_ids = self._seed_runs(dag_maker, run_count=4)
+        self._set_ti_states(session, run_ids=run_ids, state=TaskInstanceState.SUCCESS)
+        with mock.patch(
+            "airflow.models.taskinstance.clear_task_instances", wraps=clear_task_instances
+        ) as spy:
+            cleared = bulk_clear_dag_runs(dag_id=self.DAG_ID, run_ids=run_ids, session=session)
+        assert cleared == 4
+        assert spy.call_count == 1
+        passed_tis = spy.call_args.args[0]
+        assert {ti.run_id for ti in passed_tis} == set(run_ids)

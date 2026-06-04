@@ -45,6 +45,7 @@ from airflow.jobs.job import Job
 from airflow.models import DagModel, DagRun, TaskInstance
 from airflow.models.errors import ParseImportError
 from airflow.models.serialized_dag import SerializedDagModel
+from airflow.models.taskinstance import bulk_clear_dag_runs
 from airflow.timetables.base import TimeRestriction
 from airflow.utils import cli as cli_utils
 from airflow.utils.cli import (
@@ -146,7 +147,9 @@ def dag_clear(args, *, session: Session = NEW_SESSION) -> None:
     ):
         raise SystemExit("--partition-date-start must be on or before --partition-date-end.")
 
-    dag = get_db_dag(bundle_names=None, dag_id=args.dag_id)
+    # Raise the same missing-Dag error as other action_cli commands even though
+    # the bulk-clear path no longer needs the SerializedDAG itself.
+    get_db_dag(bundle_names=None, dag_id=args.dag_id)
 
     query = select(DagRun.run_id, DagRun.partition_key, DagRun.partition_date).where(
         DagRun.dag_id == args.dag_id
@@ -182,14 +185,13 @@ def dag_clear(args, *, session: Session = NEW_SESSION) -> None:
             print("Cancelled, nothing was cleared.")
             return
 
-    cleared = 0
-    for run_id in run_ids:
-        cleared += dag.clear(
-            run_id=run_id,
-            only_failed=args.only_failed,
-            only_running=args.only_running,
-            session=session,
-        )
+    cleared = bulk_clear_dag_runs(
+        dag_id=args.dag_id,
+        run_ids=run_ids,
+        only_failed=args.only_failed,
+        only_running=args.only_running,
+        session=session,
+    )
     print(f"Cleared {cleared} task instance(s) across {len(run_ids)} Dag run(s).")
 
 

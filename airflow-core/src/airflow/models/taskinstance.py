@@ -477,6 +477,71 @@ def clear_task_instances(
     session.flush()
 
 
+# Bound on the IN-list size and per-flush TI batch for bulk_clear_dag_runs.
+BULK_CLEAR_RUNS_CHUNK_SIZE = 500
+
+
+def bulk_clear_dag_runs(
+    *,
+    dag_id: str,
+    run_ids: Collection[str],
+    only_failed: bool = False,
+    only_running: bool = False,
+    dag_run_state: DagRunState = DagRunState.QUEUED,
+    run_on_latest_version: bool = False,
+    session: Session,
+) -> int:
+    """
+    Clear task instances across multiple DagRuns of one Dag in a single bulk pass.
+
+    Same TI reset and DagRun re-queue semantics as calling
+    :meth:`SerializedDAG.clear` once per run, but folds the per-run TI fetch
+    into a single ``SELECT ... WHERE run_id IN (...)`` per chunk.
+
+    :param dag_id: Dag whose runs are being cleared.
+    :param run_ids: run IDs to clear; empty input is a no-op.
+    :param only_failed: only reset failed / upstream-failed TIs.
+    :param only_running: only reset running TIs.
+    :param dag_run_state: state applied to finished runs.
+    :param run_on_latest_version: re-queue against the latest Dag/bundle version.
+    :param session: current session; not committed here.
+    :return: total number of TIs reset.
+    """
+    run_id_list = list(run_ids)
+    if not run_id_list:
+        return 0
+
+    state_filter: list[TaskInstanceState] = []
+    if only_failed:
+        state_filter += [TaskInstanceState.FAILED, TaskInstanceState.UPSTREAM_FAILED]
+    if only_running:
+        state_filter += [TaskInstanceState.RUNNING]
+
+    total_cleared = 0
+    for chunk_start in range(0, len(run_id_list), BULK_CLEAR_RUNS_CHUNK_SIZE):
+        chunk = run_id_list[chunk_start : chunk_start + BULK_CLEAR_RUNS_CHUNK_SIZE]
+        query = select(TaskInstance).where(
+            TaskInstance.dag_id == dag_id,
+            TaskInstance.run_id.in_(chunk),
+        )
+        if len(state_filter) == 1:
+            query = query.where(TaskInstance.state == state_filter[0])
+        elif state_filter:
+            query = query.where(TaskInstance.state.in_(state_filter))
+
+        tis = list(session.scalars(query))
+        if not tis:
+            continue
+        clear_task_instances(
+            tis,
+            session,
+            dag_run_state=dag_run_state,
+            run_on_latest_version=run_on_latest_version,
+        )
+        total_cleared += len(tis)
+    return total_cleared
+
+
 def _creator_note(val):
     """Creator for the ``note`` association proxy."""
     if isinstance(val, str):
